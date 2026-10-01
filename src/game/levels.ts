@@ -1,13 +1,42 @@
 // Legend
 // # wall   . floor   G glass (bullets pass, breakable)   T furniture (blocks walking, not bullets)
 // D door (auto orientation)   E exit   P player start
-// Enemies: m=bat  k=knife  p=pistol  s=shotgun  u=uzi  r=rifle  f=unarmed
-// Pickups: b=bat  n=knife  K=katana  i=pipe  1=pistol  2=shotgun  3=uzi  4=rifle
+// Enemies: m=bat  k=knife  p=pistol  s=shotgun  u=uzi  r=rifle  f=unarmed  B=BIG BOSS
+// Pickups: b=bat  n=knife  K=katana  i=pipe  1=pistol  2=shotgun  3=uzi  4=rifle  Z=sniper
 
 export interface LevelDef {
   name: string;
   sub: string;
   map: string[];
+  environment?: 'rooftop';
+  entryAngle?: number;
+  starterLoadout?: boolean;
+  introHint?: string;
+  helipad?: { x: number; y: number; radius: number };
+}
+
+// A rectangular arena with true wall cover, breakable windows and an entry bay.
+function createRooftopMap(): string[] {
+  const width = 48, height = 26;
+  const grid: string[][] = Array.from({ length: height }, (_, y) => Array.from({ length: width }, (_, x) => x === 0 || y === 0 || x === width - 1 || y === height - 1 ? '#' : '.'));
+  for (let x = 2; x < width - 2; x++) grid[1][x] = 'G';
+  for (let y = 2; y < 22; y++) { grid[y][1] = 'G'; grid[y][width - 2] = 'G'; }
+  for (const [px, py] of [[12, 7], [34, 7], [15, 12], [31, 12], [10, 18], [36, 18]]) {
+    for (let y = py; y < py + 2; y++) for (let x = px; x < px + 2; x++) grid[y][x] = '#';
+  }
+  // Glass accents never count as bullet/vision cover.
+  for (const x of [7, 8, 9, 38, 39, 40]) grid[4][x] = 'G';
+  for (let x = 1; x < width - 1; x++) grid[22][x] = '#';
+  grid[22][23] = grid[22][24] = 'D';
+  grid[24][20] = 'P';
+  grid[23][22] = '2';
+  grid[24][27] = 'E';
+  grid[4][24] = 'B';
+  grid[14][4] = 'Z';
+  grid[13][24] = 'K';
+  grid[17][7] = 'm';
+  grid[17][40] = 'm';
+  return grid.map((row) => row.join(''));
 }
 
 export const LEVELS: LevelDef[] = [
@@ -127,5 +156,15 @@ export const LEVELS: LevelDef[] = [
       '#.......#.........#..........#..........TT.p.#',
       '##############################################',
     ],
+  },
+  {
+    name: 'ROOFTOP',
+    sub: 'HELIPAD — THE FINAL CALL',
+    environment: 'rooftop',
+    entryAngle: -Math.PI / 2,
+    starterLoadout: false,
+    helipad: { x: 24, y: 11, radius: 5 },
+    introHint: 'BIG BOSS / M16 — pilar solid = cover. Sniper di sisi kiri, katana di tengah.',
+    map: createRooftopMap(),
   },
 ];
