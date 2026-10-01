@@ -56,6 +56,8 @@ interface Enemy {
   executing: boolean; facets: number[]; fetch: Pickup | null; attackAnim: number;
   muzzle: number;
   stagger: number; hitFlash: number; launched: boolean; hits: number; spin: number; hp: number; doomed: boolean;
+  batHits: number; launchDistance: number; launchHits: Set<number>;
+  boss: boolean; homeX: number; homeY: number; burstShots: number;
   moveVx: number; moveVy: number; moveSpeed: number; strafeDir: number; strafeT: number; dodgeCd: number; dodgeT: number;
 }
 interface Trail { x1: number; y1: number; x2: number; y2: number; life: number; max: number; enemy: boolean; w: number; }
@@ -67,7 +69,21 @@ interface Shard { x: number; y: number; z: number; vz: number; vx: number; vy: n
 interface Particle { x: number; y: number; vx: number; vy: number; life: number; max: number; color: string; size: number; kind: 'spark' | 'flash' | 'ring' | 'star' | 'smoke' | 'cone' | 'slash'; angle?: number; }
 interface FText { x: number; y: number; text: string; life: number; color: string; size: number; }
 
-type GState = 'intro' | 'play' | 'cleared' | 'complete' | 'dead' | 'paused';
+export type GState = 'intro' | 'play' | 'cleared' | 'complete' | 'dead' | 'paused';
+
+export interface GameSnapshot {
+  state: GState;
+  level: number;
+  score: number;
+  grade: string;
+  focusPercent: number;
+  focusActive: boolean;
+  canFocus: boolean;
+  action: string;
+  weaponAction: string;
+  showResults: boolean;
+  nextReady: boolean;
+}
 
 function mulberry(seed: number) {
   return () => {
@@ -101,6 +117,16 @@ function segDist(px: number, py: number, ax: number, ay: number, bx: number, by:
 export interface GameCallbacks {
   onQuit: () => void;
   onLevelComplete: (level: number, score: number) => void;
+  onUIChange?: (snapshot: GameSnapshot) => void;
+}
+
+// Broad shoulders, a tapered waist and a compact chest, rather than a large oval.
+function humanTorsoPoints(facets: number[]): [number, number][] {
+  const shape: [number, number][] = [[6.7, -4.8], [3.7, -9.2], [-1, -9.5], [-6.2, -5.9], [-7, -3.3], [-7, 3.3], [-6.2, 5.9], [-1, 9.5], [3.7, 9.2], [6.7, 4.8]];
+  return shape.map(([x, y], i) => {
+    const variation = 1 + ((facets[i % facets.length] || 1) - 1) * 0.35;
+    return [x * variation, y * variation];
+  });
 }
 
 export class Game {
@@ -172,6 +198,12 @@ export class Game {
   hintT = 0;
   chantIdx = -1;
   destroyed = false;
+  suspended = false;
+  touch = { enabled: false, moveX: 0, moveY: 0, aimX: 0, aimY: 0, aiming: false, angle: 0, focus: false };
+  private aimSource: 'mouse' | 'touch' = 'mouse';
+  private lastUIStamp = '';
+  private lastUIAt = -1;
+  private levelReported = false;
 
   constructor(canvas: HTMLCanvasElement, level: number, cb: GameCallbacks) {
     this.canvas = canvas;
@@ -195,8 +227,9 @@ export class Game {
   bind() {
     this.on(window, 'resize', () => this.resize());
     this.on(window, 'keydown', ((e: KeyboardEvent) => {
-      if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Tab'].includes(e.code)) e.preventDefault();
-      if (e.repeat) return;
+      if (e.target instanceof HTMLElement && e.target.closest('button') && (e.code === 'Enter' || e.code === 'Space')) return;
+      if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+      if (e.repeat || this.suspended) return;
       this.keys.add(e.code);
       if (e.code === 'Space') this.spacePressed = true;
       if (e.code === 'KeyR') this.restart();
@@ -215,11 +248,10 @@ export class Game {
       if (e.code === 'KeyC') this.focusHeld = true;
       if (e.code === 'KeyT' && !this.noSlowMo) { this.superTime = !this.superTime; this.showHint(this.superTime ? 'SUPERHOT MODE: WAKTU HANYA BERJALAN SAAT KAMU BERGERAK' : 'SUPERHOT MODE: OFF', 2.5); }
       if (e.code === 'Escape') {
-        if (this.state === 'paused') this.state = this.prevState;
-        else if (this.state === 'play' || this.state === 'cleared' || this.state === 'intro') { this.prevState = this.state; this.state = 'paused'; }
-        else if (this.state === 'dead') this.cb.onQuit();
+        if (this.state === 'dead') this.quit();
+        else this.togglePause();
       }
-      if (e.code === 'KeyQ' && this.state === 'paused') this.cb.onQuit();
+      if (e.code === 'KeyQ' && this.state === 'paused') this.quit();
       if ((e.code === 'Enter' || e.code === 'Space') && this.state === 'complete' && this.stateT > 3.2) this.advance();
     }) as EventListener);
     this.on(window, 'keyup', ((e: KeyboardEvent) => { this.keys.delete(e.code); if (e.code === 'KeyC') this.focusHeld = false; }) as EventListener);
@@ -227,8 +259,10 @@ export class Game {
       const r = this.canvas.getBoundingClientRect();
       this.mouse.x = e.clientX - r.left;
       this.mouse.y = e.clientY - r.top;
+      this.aimSource = 'mouse';
     }) as EventListener);
     this.on(this.canvas, 'mousedown', ((e: MouseEvent) => {
+      if (this.suspended) return;
       initAudio();
       if (e.button === 0) { this.mouse.down = true; this.mouse.pressed = true; }
       if (e.button === 2) this.mouse.right = true;
@@ -238,15 +272,135 @@ export class Game {
     }) as EventListener);
     this.on(window, 'mouseup', ((e: MouseEvent) => { if (e.button === 0) this.mouse.down = false; if (e.button === 1) this.focusHeld = false; }) as EventListener);
     this.on(window, 'auxclick', ((e: MouseEvent) => { if (e.button === 1) e.preventDefault(); }) as EventListener);
-    this.on(window, 'blur', () => { this.focusHeld = false; this.mouse.down = false; this.keys.clear(); });
+    this.on(window, 'blur', () => this.resetInputs());
+    this.on(document, 'visibilitychange', () => { if (document.hidden) { this.resetInputs(); if (this.state !== 'paused') this.togglePause(); } });
     this.on(this.canvas, 'contextmenu', ((e: Event) => e.preventDefault()) as EventListener);
   }
 
   destroy() {
+    this.resetInputs();
     this.destroyed = true;
     cancelAnimationFrame(this.raf);
     this.handlers.forEach(([t, ev, fn]) => t.removeEventListener(ev, fn));
     setMusicDuck(false);
+  }
+
+  // Public input API: touch controls feed the same combat/movement systems as PC.
+  setTouchControls(enabled: boolean) {
+    if (this.touch.enabled === enabled) return;
+    this.resetTouchInput();
+    this.touch.enabled = enabled;
+    this.touch.angle = this.player.angle;
+    this.aimSource = enabled ? 'touch' : 'mouse';
+    this.emitUI(true);
+  }
+
+  setTouchMove(x: number, y: number) {
+    if (!this.touch.enabled || this.suspended || this.state === 'paused') return;
+    const length = Math.max(1, Math.hypot(x, y));
+    this.touch.moveX = x / length;
+    this.touch.moveY = y / length;
+  }
+
+  setTouchAim(x: number, y: number) {
+    if (!this.touch.enabled || this.suspended || this.state === 'paused') return;
+    const length = Math.max(1, Math.hypot(x, y));
+    this.touch.aimX = x / length;
+    this.touch.aimY = y / length;
+    this.touch.aiming = Math.hypot(x, y) > 0.1;
+    if (this.touch.aiming) {
+      this.aimSource = 'touch';
+      this.touch.angle = Math.atan2(y, x) - this.cam.rot;
+    }
+  }
+
+  setTouchFocus(held: boolean) {
+    this.touch.focus = held && this.touch.enabled && !this.suspended && this.state !== 'paused';
+  }
+
+  pressTouchAction(action: 'kick' | 'action' | 'weapon') {
+    if (this.suspended || !this.player.alive || !['intro', 'play', 'cleared'].includes(this.state)) return;
+    if (action === 'kick') this.kickBuffer = 0.22;
+    if (action === 'action') this.spacePressed = true;
+    if (action === 'weapon') this.mouse.right = true;
+  }
+
+  resetTouchInput() {
+    this.touch.moveX = this.touch.moveY = this.touch.aimX = this.touch.aimY = 0;
+    this.touch.aiming = this.touch.focus = false;
+  }
+
+  resetInputs() {
+    this.keys.clear();
+    this.mouse.down = this.mouse.pressed = this.mouse.right = false;
+    this.spacePressed = this.kickPressed = this.focusHeld = false;
+    this.kickBuffer = 0;
+    this.resetTouchInput();
+  }
+
+  setSuspended(suspended: boolean) {
+    if (this.suspended === suspended) return;
+    this.suspended = suspended;
+    this.resetInputs();
+  }
+
+  togglePause() {
+    if (this.state === 'paused') {
+      this.state = this.prevState;
+      setMusicDuck(false);
+    } else if (this.state === 'play' || this.state === 'cleared' || this.state === 'intro') {
+      this.prevState = this.state;
+      this.state = 'paused';
+      setMusicDuck(true);
+    } else return;
+    this.resetInputs();
+    this.emitUI(true);
+  }
+
+  quit() {
+    this.resetInputs();
+    this.reportCompletion();
+    this.cb.onQuit();
+  }
+
+  private reportCompletion() {
+    if (this.state !== 'complete' || this.levelReported) return;
+    this.levelReported = true;
+    this.cb.onLevelComplete(this.levelIndex, this.score);
+  }
+
+  getSnapshot(): GameSnapshot {
+    let action = this.hostage ? 'LEMPAR SANDERA' : this.player.exec ? 'EKSEKUSI' : 'SPRINT';
+    if (!this.hostage && !this.player.exec) {
+      let distance = Infinity;
+      for (const enemy of this.enemies) {
+        if (enemy.launched || enemy.state === 'hostage') continue;
+        const d = Math.hypot(enemy.x - this.player.x, enemy.y - this.player.y);
+        if (d < (enemy.state === 'down' ? 34 : 40) && d < distance) {
+          distance = d;
+          action = enemy.state === 'down' ? 'EKSEKUSI' : 'SANDERA';
+        }
+      }
+    }
+    return {
+      state: this.state, level: this.levelIndex, score: this.score, grade: this.grade(),
+      focusPercent: Math.round(this.focus * 100), focusActive: this.focusActive,
+      canFocus: !this.noSlowMo && this.focus > 0.02,
+      action, weaponAction: this.player.weapon ? 'LEMPAR' : 'AMBIL',
+      showResults: this.state === 'complete' && this.stateT >= 3,
+      nextReady: this.state === 'complete' && this.stateT > 3.2,
+    };
+  }
+
+  private emitUI(force = false) {
+    if (!this.cb.onUIChange || (!force && this.time - this.lastUIAt < 0.1)) return;
+    this.lastUIAt = this.time;
+    const snapshot = this.getSnapshot();
+    const stamp = JSON.stringify(snapshot);
+    if (force || stamp !== this.lastUIStamp) {
+      this.lastUIStamp = stamp;
+      this.cb.onUIChange(snapshot);
+    }
   }
 
   resize() {
@@ -263,6 +417,7 @@ export class Game {
   // ---------------- Level ----------------
   loadLevel(i: number) {
     this.levelIndex = i;
+    this.levelReported = false;
     const def = LEVELS[i];
     const width = Math.max(...def.map.map((r) => r.length));
     this.h = def.map.length;
@@ -274,6 +429,7 @@ export class Game {
     this.levelTime = 0; this.redFlash = 0; this.shake = 0; this.chantIdx = -1;
     const rng = mulberry(1337 + i * 77);
     const p = this.player;
+    this.resetInputs();
     p.weapon = null; p.ammo = 0; p.cd = 0; p.alive = true; p.exec = null; p.attackAnim = 0;
     p.dashT = 0; p.dashCd = 0; p.comboStep = 0; p.comboWin = 0; p.hitCount = 0; p.hitCountT = 0; p.kickCd = 0; p.kickAnim = 0; p.lungeT = 0; p.recoil = 0;
     p.hp = 3; p.hpT = 0; p.hurtT = 0; p.swing = null; p.meleeStep = 0; p.meleeWin = 0;
@@ -289,18 +445,20 @@ export class Game {
       for (let x = 0; x < this.w; x++) {
         const c = this.tiles[y][x];
         const cx = x * T + T / 2, cy = y * T + T / 2;
-        if (c === 'P') { p.x = cx; p.y = cy; this.tiles[y][x] = '.'; p.angle = 0; }
+        if (c === 'P') { p.x = cx; p.y = cy; this.tiles[y][x] = '.'; p.angle = def.entryAngle || 0; this.touch.angle = p.angle; }
         else if (c === 'E') { this.exitX = x; this.exitY = y; }
         else if (c === 'D') {
           this.tiles[y][x] = '.';
           const horiz = solidCh(x - 1, y) && solidCh(x + 1, y);
           if (horiz) this.doors.push({ hx: x * T, hy: cy, closed: 0, angle: 0, av: 0, pushT: 9, pusher: 'enemy' });
           else this.doors.push({ hx: cx, hy: y * T, closed: Math.PI / 2, angle: Math.PI / 2, av: 0, pushT: 9, pusher: 'enemy' });
-        } else if (c in enemyMap) {
+        } else if (c in enemyMap || c === 'B') {
           this.tiles[y][x] = '.';
           const base = rng() < 0.4 ? 'patrol' : 'idle';
           const ang = [0, Math.PI / 2, Math.PI, -Math.PI / 2][Math.floor(rng() * 4)];
-          this.enemies.push(this.makeEnemy(cx, cy, ang, enemyMap[c], base));
+          const enemy = this.makeEnemy(cx, cy, c === 'B' ? Math.PI / 2 : ang, c === 'B' ? 'rifle' : enemyMap[c], c === 'B' ? 'idle' : base);
+          if (c === 'B') { enemy.boss = true; enemy.r = 12; enemy.hp = 6; enemy.react = 0.7; }
+          this.enemies.push(enemy);
         } else if (c in pickMap) {
           this.tiles[y][x] = '.';
           const t = pickMap[c];
@@ -309,8 +467,8 @@ export class Game {
       }
     }
     this.totalEnemies = this.enemies.length;
-    // starter loadout near the player: SNIPER, RIFLE, KATANA
-    {
+    // The boss room uses only its intentional, risk/reward pickup placements.
+    if (def.starterLoadout !== false) {
       const ptx = Math.floor(p.x / T), pty = Math.floor(p.y / T);
       const spots: [number, number][] = [];
       for (let r = 1; r <= 3 && spots.length < 5; r++)
@@ -333,7 +491,8 @@ export class Game {
     this.state = 'intro';
     this.stateT = 0;
     setMusicDuck(false);
-    this.showHint('SPASI dekat musuh = sandera/perisai; SPACE lagi = lempar • N = no slow-mo • sprint: SPASI', 6);
+    this.showHint(def.introHint || 'SPASI dekat musuh = sandera/perisai; SPACE lagi = lempar • N = no slow-mo • sprint: SPASI', 6);
+    this.emitUI(true);
   }
 
   makeEnemy(x: number, y: number, angle: number, weapon: WType | null, base: 'idle' | 'patrol'): Enemy {
@@ -344,6 +503,7 @@ export class Game {
       walkT: Math.random() * 10, alertFlash: 0, executing: false,
       facets: Array.from({ length: 9 }, () => rand(0.86, 1.12)), fetch: null, attackAnim: 0, muzzle: 0,
       stagger: 0, hitFlash: 0, launched: false, hits: 0, spin: 0, hp: 3, doomed: false,
+      batHits: 0, launchDistance: 0, launchHits: new Set(), boss: false, homeX: x, homeY: y, burstShots: 0,
       moveVx: 0, moveVy: 0, moveSpeed: 0, strafeDir: Math.random() < 0.5 ? -1 : 1, strafeT: rand(1.5, 3), dodgeCd: 0, dodgeT: 0,
     };
   }
@@ -356,7 +516,8 @@ export class Game {
   }
 
   advance() {
-    this.cb.onLevelComplete(this.levelIndex, this.score);
+    if (this.state !== 'complete' || this.stateT <= 3.2) return;
+    this.reportCompletion();
     if (this.levelIndex + 1 < LEVELS.length) this.loadLevel(this.levelIndex + 1);
     else this.cb.onQuit();
   }
@@ -380,12 +541,27 @@ export class Game {
     for (let y = 0; y < this.h; y++) for (let x = 0; x < this.w; x++) {
       if (this.tiles[y][x] === '#') continue;
       const alt = ((x >> 1) + (y >> 1)) % 2 === 0;
-      f.fillStyle = alt ? '#f4f4f5' : '#efeff1';
+      f.fillStyle = LEVELS[this.levelIndex].environment === 'rooftop' ? (alt ? '#e9edf0' : '#e2e7eb') : (alt ? '#f4f4f5' : '#efeff1');
       f.fillRect(x * T, y * T, T, T);
       f.strokeStyle = 'rgba(0,0,0,0.045)';
       f.lineWidth = 1;
       f.strokeRect(x * T + 0.5, y * T + 0.5, T, T);
     }
+    const helipad = LEVELS[this.levelIndex].helipad;
+    if (helipad) {
+      const hx = (helipad.x + 0.5) * T, hy = (helipad.y + 0.5) * T, radius = helipad.radius * T;
+      f.save();
+      f.strokeStyle = 'rgba(98,115,127,0.3)'; f.lineWidth = 4;
+      f.beginPath(); f.arc(hx, hy, radius, 0, Math.PI * 2); f.stroke();
+      f.strokeStyle = 'rgba(255,255,255,0.72)'; f.lineWidth = 2;
+      f.beginPath(); f.arc(hx, hy, radius - 10, 0, Math.PI * 2); f.stroke();
+      f.strokeStyle = 'rgba(128,144,155,0.4)'; f.lineWidth = 17; f.lineCap = 'square';
+      f.beginPath(); f.moveTo(hx - 33, hy - 49); f.lineTo(hx - 33, hy + 49); f.moveTo(hx + 33, hy - 49); f.lineTo(hx + 33, hy + 49); f.moveTo(hx - 33, hy); f.lineTo(hx + 33, hy); f.stroke();
+      f.strokeStyle = 'rgba(224,20,30,0.25)'; f.lineWidth = 5;
+      for (let i = 0; i < 4; i++) { f.beginPath(); f.arc(hx, hy, radius + 5, i * Math.PI / 2 - 0.12, i * Math.PI / 2 + 0.12); f.stroke(); }
+      f.restore();
+    }
+
     // soft wall shadows
     f.fillStyle = 'rgba(40,44,60,0.09)';
     for (let y = 0; y < this.h; y++) for (let x = 0; x < this.w; x++) {
@@ -658,12 +834,7 @@ export class Game {
     if (h.side < 0) ctx.rect(-40, -40, 80, 40); else ctx.rect(-40, 0, 80, 40);
     ctx.clip();
     ctx.rotate(h.body - h.cut);
-    const n = h.facets.length;
-    const pts: [number, number][] = [];
-    for (let i = 0; i < n; i++) {
-      const a = (i / n) * Math.PI * 2;
-      pts.push([Math.cos(a) * 8 * h.facets[i], Math.sin(a) * 13.5 * h.facets[i]]);
-    }
+    const pts = humanTorsoPoints(h.facets);
     const g = ctx.createLinearGradient(-8, -13, 8, 13);
     g.addColorStop(0, '#ff8a7e'); g.addColorStop(0.48, '#f0444c'); g.addColorStop(1, '#b92636');
     ctx.fillStyle = g;
@@ -758,6 +929,9 @@ export class Game {
     e.vx = dx * speed; e.vy = dy * speed;
     e.moveVx = e.moveVy = 0;
     e.launched = speed > 300;
+    e.launchDistance = 0;
+    e.launchHits.clear();
+    e.doomed = false;
     e.spin = speed > 300 ? rand(-14, 14) : 0;
     e.downAngle = Math.atan2(dy, dx);
     e.windup = 0;
@@ -899,8 +1073,9 @@ export class Game {
     this.time += dt;
     if (this.hitstop > 0 && !this.noSlowMo) { this.hitstop -= dt; dt *= 0.05; }
     else if (this.noSlowMo) this.hitstop = 0;
-    if (this.state !== 'paused') this.update(dt);
+    if (this.state !== 'paused' && !this.suspended) this.update(dt);
     this.render();
+    this.emitUI();
     this.mouse.pressed = false;
     this.mouse.right = false;
     this.spacePressed = false;
@@ -929,7 +1104,7 @@ export class Game {
     if (!this.noSlowMo && this.slowmo > 0) target = Math.min(target, this.state === 'dead' ? 0.25 : 0.35);
     // FOCUS slow-mo: hold mouse wheel (middle button) or C
     const canFocus = p.alive && (this.state === 'play' || this.state === 'cleared');
-    if (!this.noSlowMo && this.focusHeld && canFocus && this.focus > 0.02) {
+    if (!this.noSlowMo && (this.focusHeld || this.touch.focus) && canFocus && this.focus > 0.02) {
       if (!this.focusActive) { this.focusActive = true; sfx.slowIn(); }
       this.focus = Math.max(0, this.focus - rdt / 5);
       target = Math.min(target, 0.2);
@@ -989,6 +1164,11 @@ export class Game {
     p.hitCountT -= dt;
     if (p.hitCountT <= 0) p.hitCount = 0;
     this.moveAmt = 0;
+    if (this.touch.enabled && this.aimSource === 'touch') {
+      if (this.touch.aiming) this.touch.angle = Math.atan2(this.touch.aimY, this.touch.aimX) - this.cam.rot;
+      const cursor = this.worldToScreen(p.x + Math.cos(this.touch.angle) * 240, p.y + Math.sin(this.touch.angle) * 240);
+      this.mouse.x = cursor.x; this.mouse.y = cursor.y;
+    }
     const mw = this.mouseWorld();
 
     if (p.exec) {
@@ -1069,8 +1249,13 @@ export class Game {
     if (this.keys.has('KeyS') || this.keys.has('ArrowDown')) my += 1;
     if (this.keys.has('KeyA') || this.keys.has('ArrowLeft')) mx -= 1;
     if (this.keys.has('KeyD') || this.keys.has('ArrowRight')) mx += 1;
+    if (this.touch.enabled) {
+      const c = Math.cos(-this.cam.rot), s = Math.sin(-this.cam.rot);
+      mx += this.touch.moveX * c - this.touch.moveY * s;
+      my += this.touch.moveX * s + this.touch.moveY * c;
+    }
     const ml = Math.hypot(mx, my);
-    const speed = 215;
+    const speed = 215 * Math.min(1, ml);
     if (p.dashT <= 0) {
       const tvx = ml ? (mx / ml) * speed : 0;
       const tvy = ml ? (my / ml) * speed : 0;
@@ -1096,7 +1281,7 @@ export class Game {
       }
     }
     this.collide(p, p.r);
-    if (p.lungeT <= 0) p.angle = Math.atan2(mw.y - p.y, mw.x - p.x);
+    if (p.lungeT <= 0) p.angle = this.touch.enabled && this.aimSource === 'touch' ? this.touch.angle : Math.atan2(mw.y - p.y, mw.x - p.x);
 
     // ---------- SPACE: take a hostage, execute, throw, or sprint ----------
     if (this.spacePressed) {
@@ -1144,10 +1329,11 @@ export class Game {
 
     // attack
     const w = p.weapon;
-    if (this.mouse.down && p.cd <= 0) {
+    const touchAttack = this.touch.enabled && this.touch.aiming;
+    if ((this.mouse.down || touchAttack) && p.cd <= 0) {
       if (w && !WEAPONS[w].melee) {
         const d = WEAPONS[w];
-        if (d.auto || this.mouse.pressed) {
+        if (d.auto || this.mouse.pressed || touchAttack) {
           if (p.ammo > 0) {
             this.fire(p.x, p.y, p.angle, w, 0);
             p.ammo--;
@@ -1162,7 +1348,7 @@ export class Game {
         }
       } else if (w && WEAPONS[w].melee) {
         this.playerMelee();
-      } else if (this.mouse.pressed) {
+      } else if (this.mouse.pressed || touchAttack) {
         this.playerFist();
       }
     }
@@ -1221,6 +1407,8 @@ export class Game {
     e.doomed = false;
     e.downT = 3.3;
     e.launched = true;
+    e.launchDistance = 0;
+    e.launchHits.clear();
     e.spin = rand(-9, 9);
     e.downAngle = p.angle;
     e.vx = dx * 590;
@@ -1260,12 +1448,12 @@ export class Game {
   }
 
   // pick the best target for melee magnetism
-  meleeTarget(range: number, arc: number) {
+  meleeTarget(range: number, arc: number, includeDowned = false) {
     const p = this.player;
     let target: Enemy | null = null;
     let score = Infinity;
     for (const e of this.enemies) {
-      if (e.state === 'down' || e === this.hostage || e.state === 'hostage') continue;
+      if ((e.state === 'down' && !includeDowned) || e.executing || e === this.hostage || e.state === 'hostage') continue;
       const dx = e.x - p.x, dy = e.y - p.y, dist = Math.hypot(dx, dy);
       if (dist > range + e.r) continue;
       const ad = Math.abs(angDiff(p.angle, Math.atan2(dy, dx)));
@@ -1409,7 +1597,7 @@ export class Game {
     p.swing = { from, to, t: 0, dur, kind: blade ? 'blade' : 'blunt', spin };
     p.attackAnim = dur;
     sfx.swing(fin);
-    const target = this.meleeTarget(range + 22, Math.min(arc, 2.8));
+    const target = this.meleeTarget(range + 22, Math.min(arc, 2.8), w === 'bat');
     if (target) this.lungeTo(target, 24);
     const gx = p.x + Math.cos(p.angle) * 26, gy = p.y + Math.sin(p.angle) * 26;
     if (this.tile(Math.floor(gx / T), Math.floor(gy / T)) === 'G') this.breakGlass(Math.floor(gx / T), Math.floor(gy / T), Math.cos(p.angle), Math.sin(p.angle));
@@ -1439,6 +1627,17 @@ export class Game {
       if (w === 'katana') {
         const label = spin ? (victims.length > 1 ? `SPIN SLICE x${victims.length}` : 'SPIN SLICE') : i > 0 ? 'DOUBLE SLICE' : ['SLICED', 'CROSS CUT'][step] || 'SLICED';
         this.sliceEnemy(e, toE + (Math.PI / 2) * dir, 700 + step * 150, label);
+      } else if (w === 'bat') {
+        e.batHits++;
+        if (e.batHits > 1) {
+          this.killEnemy(e, Math.cos(toE), Math.sin(toE), 800, 'DOUBLE IMPACT!');
+        } else {
+          // One bat hit launches a living body. Only the second hit or a solid
+          // wall impact shatters it; nearby enemies are hit later by its flight.
+          this.knockdown(e, Math.cos(toE), Math.sin(toE), 200, fin ? 900 : 720, 'HOME RUN!');
+          this.hitstop = 0.08;
+          this.shake = Math.max(this.shake, 11);
+        }
       } else if (fin && heavy) {
         this.knockdown(e, Math.cos(toE), Math.sin(toE), 300, 1000, 'HOME RUN!');
         e.doomed = true;
@@ -1499,7 +1698,7 @@ export class Game {
     const p = this.player;
     if (!p.alive) return false;
     const dx = p.x - e.x, dy = p.y - e.y, d = Math.hypot(dx, dy);
-    if (d > 600) return false;
+    if (d > (e.boss ? 1200 : 600)) return false;
     const aware = e.state === 'alert' || e.state === 'search' || e.state === 'fetch';
     if (!aware && d > 44 && Math.abs(angDiff(e.angle, Math.atan2(dy, dx))) > 1.2) return false;
     return this.los(e.x, e.y, p.x, p.y);
@@ -1593,7 +1792,8 @@ export class Game {
         continue;
       }
 
-      const sees = this.canSee(e);
+      if (e.boss && e.weapon && !WEAPONS[e.weapon].melee) { this.updateBoss(e, dt); continue; }
+      const sees = this.state !== 'intro' && this.canSee(e);
       if (sees) {
         e.lastX = p.x; e.lastY = p.y; e.lostT = 0;
         if (e.state !== 'alert') {
@@ -1768,7 +1968,46 @@ export class Game {
     }
   }
 
-  // flying body after kick: returns true if enemy was destroyed
+  updateBoss(e: Enemy, dt: number) {
+    const p = this.player;
+    if (!p.alive || this.state === 'intro') return;
+    const sees = this.canSee(e);
+    if (!e.weapon) {
+      // A disarmed boss remains a normal, dangerous melee opponent.
+      e.state = 'alert';
+      e.react = 0.25;
+      return;
+    }
+    const dx = p.x - e.x, dy = p.y - e.y;
+    const distance = Math.hypot(dx, dy);
+    const lead = Math.min(0.22, distance / 1900);
+    const aim = Math.atan2(p.y + p.vy * lead - e.y, p.x + p.vx * lead - e.x);
+    if (sees) {
+      if (e.state !== 'alert') { e.state = 'alert'; e.react = 0.55; e.alertFlash = 0.7; }
+      e.lastX = p.x; e.lastY = p.y;
+      e.angle = rotTo(e.angle, aim, 10 * dt);
+      e.react -= dt;
+    } else {
+      e.state = 'search';
+      e.react = Math.max(e.react, 0.3);
+      e.burstShots = 0;
+      e.angle = rotTo(e.angle, Math.atan2(e.lastY - e.y, e.lastX - e.x), 4 * dt);
+    }
+    if (e.strafeT <= 0) { e.strafeDir *= -1; e.strafeT = rand(1.2, 2); }
+    const tx = Math.max(e.homeX - 135, Math.min(e.homeX + 135, e.x + e.strafeDir * 60));
+    const ty = e.homeY + (distance < 170 ? -20 : 0);
+    if (this.clearPath(e.x, e.y, tx, ty)) this.moveEnemy(e, tx, ty, 65, dt, false);
+    else { e.strafeDir *= -1; e.strafeT = 0.4; }
+    if (sees && e.react <= 0 && e.cd <= 0 && Math.abs(angDiff(e.angle, aim)) < 0.12) {
+      this.fire(e.x, e.y, e.angle, 'rifle', e.id, 0.35);
+      e.muzzle = 0.06;
+      e.burstShots++;
+      e.cd = e.burstShots >= 6 ? 0.72 : WEAPONS.rifle.cooldown;
+      if (e.burstShots >= 6) e.burstShots = 0;
+    }
+  }
+
+  // Flying bodies collide only while travelling, never as an AoE melee hit.
   updateLaunched(e: Enemy, dt: number) {
     const sp = Math.hypot(e.vx, e.vy);
     e.downAngle += e.spin * dt * Math.min(1, sp / 400);
@@ -1785,10 +2024,12 @@ export class Game {
       // glass: smash through
       const gtx = Math.floor((nx + dirx * r) / T), gty = Math.floor((ny + diry * r) / T);
       if (this.tile(gtx, gty) === 'G') { this.breakGlass(gtx, gty, dirx, diry); e.vx *= 0.75; e.vy *= 0.75; this.texts.push({ x: e.x, y: e.y - 20, text: 'THROUGH GLASS', life: 0.9, color: '#e0141e', size: 10 }); }
+      const tileX = this.tile(Math.floor((nx + Math.sign(e.vx) * r) / T), Math.floor(e.y / T));
+      const tileY = this.tile(Math.floor(e.x / T), Math.floor((ny + Math.sign(e.vy) * r) / T));
       const hitX = this.solidAt(nx + Math.sign(e.vx) * r, e.y);
       const hitY = this.solidAt(e.x, ny + Math.sign(e.vy) * r);
       if (hitX || hitY) {
-        if (cur > 300) {
+        if ((cur > 300 || e.batHits > 0) && (tileX === '#' || tileY === '#')) {
           // WALL SPLAT — shatter against the wall
           this.killEnemy(e, -dirx * 0.3 + (hitY ? dirx : 0), -diry * 0.3 + (hitX ? diry : 0), 900, 'WALL SPLAT');
           this.shake = Math.max(this.shake, 14);
@@ -1799,13 +2040,17 @@ export class Game {
         sfx.door();
         break;
       }
+      const previousX = e.x, previousY = e.y;
+      e.launchDistance += Math.hypot(nx - e.x, ny - e.y);
       e.x = nx; e.y = ny;
-      // bowling into other enemies
-      if (cur > 200) {
+      // An actual advancing body must reach the other enemy first.
+      if (cur > 200 && e.launchDistance > 4) {
         for (const o of this.enemies) {
-          if (o === e || o.state === 'down') continue;
-          if (Math.hypot(o.x - e.x, o.y - e.y) < r + o.r) {
-            this.knockdown(o, dirx, diry, 250, cur * 0.75, 'STRIKE!');
+          if (o === e || o.state === 'down' || o.state === 'hostage' || e.launchHits.has(o.id)) continue;
+          const approaching = (o.x - previousX) * dirx + (o.y - previousY) * diry > 0;
+          if (approaching && Math.hypot(o.x - e.x, o.y - e.y) < r + o.r) {
+            e.launchHits.add(o.id);
+            this.knockdown(o, dirx, diry, 250, cur * 0.75, 'BODY COLLISION!');
             this.impact(o.x, o.y, Math.atan2(diry, dirx), 1);
             e.vx *= 0.55; e.vy *= 0.55;
             this.hitstop = 0.05;
@@ -2177,50 +2422,75 @@ export class Game {
 
   drawLimb(ctx: CanvasRenderingContext2D, x1: number, y1: number, x2: number, y2: number, width: number, color: string, shine: string) {
     const dx = x2 - x1, dy = y2 - y1;
-    const len = Math.max(1, Math.hypot(dx, dy));
-    const nx = -dy / len, ny = dx / len;
-    const r0 = width * 0.48, r1 = width * 0.37;
+    const length = Math.max(1, Math.hypot(dx, dy));
+    const nx = -dy / length, ny = dx / length;
+    const shoulder = width * 0.48, muscle = width * 0.62, wrist = width * 0.38;
+    const plane = (ox = 0, oy = 0) => {
+      ctx.beginPath();
+      ctx.moveTo(x1 + nx * shoulder + ox, y1 + ny * shoulder + oy);
+      ctx.quadraticCurveTo(x1 + dx * 0.4 + nx * muscle + ox, y1 + dy * 0.4 + ny * muscle + oy, x2 + nx * wrist + ox, y2 + ny * wrist + oy);
+      ctx.lineTo(x2 - nx * wrist + ox, y2 - ny * wrist + oy);
+      ctx.quadraticCurveTo(x1 + dx * 0.4 - nx * muscle + ox, y1 + dy * 0.4 - ny * muscle + oy, x1 - nx * shoulder + ox, y1 - ny * shoulder + oy);
+      ctx.closePath();
+    };
     ctx.save();
-    // A shaded tapered plane reads as a limb from overhead without the inked outline.
     ctx.fillStyle = 'rgba(78,55,60,0.1)';
+    plane(0.65, 0.85); ctx.fill();
+    const gradient = ctx.createLinearGradient(x1 + nx * shoulder, y1 + ny * shoulder, x1 - nx * shoulder, y1 - ny * shoulder);
+    gradient.addColorStop(0, shine); gradient.addColorStop(0.48, color); gradient.addColorStop(1, color);
+    ctx.fillStyle = gradient;
+    plane(); ctx.fill();
+    // A small faceted muscle plane keeps the arms athletic, not tube-thin.
+    ctx.fillStyle = 'rgba(255,255,255,0.15)';
     ctx.beginPath();
-    ctx.moveTo(x1 + nx * r0 + 0.8, y1 + ny * r0 + 1.2);
-    ctx.lineTo(x2 + nx * r1 + 0.8, y2 + ny * r1 + 1.2);
-    ctx.lineTo(x2 - nx * r1 + 0.8, y2 - ny * r1 + 1.2);
-    ctx.lineTo(x1 - nx * r0 + 0.8, y1 - ny * r0 + 1.2);
-    ctx.closePath();
-    ctx.fill();
-    const g = ctx.createLinearGradient(x1 + nx * r0, y1 + ny * r0, x1 - nx * r0, y1 - ny * r0);
-    g.addColorStop(0, shine);
-    g.addColorStop(0.42, color);
-    g.addColorStop(1, color);
-    ctx.fillStyle = g;
+    ctx.moveTo(x1 + nx * shoulder * 0.65, y1 + ny * shoulder * 0.65);
+    ctx.lineTo(x1 + dx * 0.44 + nx * muscle * 0.55, y1 + dy * 0.44 + ny * muscle * 0.55);
+    ctx.lineTo(x2 + nx * wrist * 0.15, y2 + ny * wrist * 0.15);
+    ctx.lineTo(x1 + nx * shoulder * 0.08, y1 + ny * shoulder * 0.08);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  drawHand(ctx: CanvasRenderingContext2D, x: number, y: number, r: number, angle: number, color: string, shine: string, side = 1, clenched = false) {
+    // Keep the palm compact relative to the fuller forearms.
+    r *= 0.66;
+    const palmX = r * (clenched ? 1.08 : 1.2);
+    const palmY = r * (clenched ? 0.88 : 0.78);
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(angle);
+    const shade = ctx.createLinearGradient(-r, -r, r, r);
+    shade.addColorStop(0, shine); shade.addColorStop(0.45, color); shade.addColorStop(1, color);
+    ctx.fillStyle = shade;
+    // Thumb projects sideways, but stays tucked in across a closed fist.
     ctx.beginPath();
-    ctx.moveTo(x1 + nx * r0, y1 + ny * r0);
-    ctx.lineTo(x2 + nx * r1, y2 + ny * r1);
-    ctx.lineTo(x2 - nx * r1, y2 - ny * r1);
-    ctx.lineTo(x1 - nx * r0, y1 - ny * r0);
-    ctx.closePath();
+    ctx.ellipse(-r * 0.12, side * palmY * 0.77, r * 0.42, r * (clenched ? 0.57 : 0.68), -side * 0.5, 0, Math.PI * 2);
     ctx.fill();
-    ctx.fillStyle = 'rgba(255,255,255,0.17)';
-    ctx.beginPath();
-    ctx.moveTo(x1 + nx * r0 * 0.62, y1 + ny * r0 * 0.62);
-    ctx.lineTo(x2 + nx * r1 * 0.62, y2 + ny * r1 * 0.62);
-    ctx.lineTo(x2 + nx * r1 * 0.12, y2 + ny * r1 * 0.12);
-    ctx.lineTo(x1 + nx * r0 * 0.12, y1 + ny * r0 * 0.12);
-    ctx.closePath();
-    ctx.fill();
+    ctx.beginPath(); ctx.ellipse(0, 0, palmX, palmY, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(25,15,22,0.27)';
+    ctx.lineWidth = Math.max(0.28, r * 0.12);
+    // Subtle knuckle and finger folds, not a heavy cartoon outline.
+    for (let i = -1; i <= 1; i++) {
+      const fy = i * palmY * 0.43;
+      ctx.beginPath();
+      ctx.moveTo(palmX * 0.42, fy - r * 0.12);
+      ctx.quadraticCurveTo(palmX * 0.55, fy, palmX * 0.37, fy + r * 0.1);
+      ctx.stroke();
+    }
+    ctx.beginPath(); ctx.moveTo(-r * 0.42, side * palmY * 0.4); ctx.quadraticCurveTo(-r * 0.1, side * palmY * 0.3, r * 0.22, side * palmY * 0.65); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    ctx.beginPath(); ctx.ellipse(-r * 0.14, -palmY * 0.37, palmX * 0.65, palmY * 0.23, -0.1, 0, Math.PI * 2); ctx.fill();
     ctx.restore();
   }
 
   drawHuman(x: number, y: number, angle: number, enemy: boolean, weapon: WType | null, walkT: number, attackAnim: number, facets: number[], windup = 0, muzzle = 0,
-    o: { kick?: number; side?: number; flash?: number; fistDur?: number; stagger?: number; recoil?: number; swing?: Swing | null; moveSpeed?: number; hurt?: number; held?: boolean } = {}) {
+    o: { kick?: number; side?: number; flash?: number; fistDur?: number; stagger?: number; recoil?: number; swing?: Swing | null; moveSpeed?: number; hurt?: number; held?: boolean; boss?: boolean } = {}) {
     const ctx = this.ctx;
     ctx.save();
     const gait = Math.min(1, (o.moveSpeed || 0) / 170);
     const phase = walkT * 0.06;
     const bob = Math.abs(Math.sin(phase)) * 2.1 * gait;
     ctx.translate(x, y - bob);
+    if (o.boss) ctx.scale(1.08, 1.08);
     const bodyShadow = ctx.createRadialGradient(4, 6, 2, 4, 6, 17);
     bodyShadow.addColorStop(0, 'rgba(38,34,48,0.16)');
     bodyShadow.addColorStop(0.55, 'rgba(55,50,63,0.07)');
@@ -2236,8 +2506,8 @@ export class Game {
     if (o.recoil) ctx.translate(-o.recoil * 30, 0);
 
     // Compact trailing feet stay close to the body silhouette in the top-down view.
-    const st = Math.sin(phase) * 3.2 * gait;
-    const st2 = Math.sin(phase + Math.PI) * 3.2 * gait;
+    const st = Math.sin(phase) * 1.8 * gait;
+    const st2 = Math.sin(phase + Math.PI) * 1.8 * gait;
     const footC = enemy ? '#bd2630' : '#24252a';
     const legShine = enemy ? '#ff8c80' : '#777980';
     const shoe = (sx: number, sy: number) => {
@@ -2246,28 +2516,28 @@ export class Game {
       sg.addColorStop(0.36, footC);
       sg.addColorStop(1, enemy ? '#971c27' : '#111216');
       ctx.fillStyle = sg;
-      ctx.beginPath(); ctx.ellipse(sx, sy, 4.6, 2.1, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(sx, sy, 3.4, 2, 0, 0, Math.PI * 2); ctx.fill();
       ctx.fillStyle = 'rgba(255,255,255,0.3)';
       ctx.beginPath(); ctx.ellipse(sx + 0.4, sy - 0.65, 2.3, 0.55, 0, 0, Math.PI * 2); ctx.fill();
     };
     if (kick > 0) {
-      this.drawLimb(ctx, -4, -3.4, -8, -3.2, 3.1, footC, legShine);
-      this.drawLimb(ctx, -8, -3.2, -11, -3.2, 2.7, footC, legShine);
-      shoe(-11, -3.2);
+      this.drawLimb(ctx, -1, -3.1, -3.5, -3, 4.2, footC, legShine);
+      this.drawLimb(ctx, -3.5, -3, -6, -3, 3.6, footC, legShine);
+      shoe(-6, -3);
     } else {
-      this.drawLimb(ctx, -4, -2.8, -8 + st * 0.35, -3.2, 3.2, footC, legShine);
-      this.drawLimb(ctx, -8 + st * 0.35, -3.2, -11 + st, -3.2, 2.8, footC, legShine);
-      this.drawLimb(ctx, -4, 2.8, -8 + st2 * 0.35, 3.2, 3.2, footC, legShine);
-      this.drawLimb(ctx, -8 + st2 * 0.35, 3.2, -11 + st2, 3.2, 2.8, footC, legShine);
-      shoe(-11 + st, -3.2);
-      shoe(-11 + st2, 3.2);
+      this.drawLimb(ctx, -1, -2.6, -3.5 + st * 0.35, -3, 4.3, footC, legShine);
+      this.drawLimb(ctx, -3.5 + st * 0.35, -3, -6 + st, -3, 3.6, footC, legShine);
+      this.drawLimb(ctx, -1, 2.6, -3.5 + st2 * 0.35, 3, 4.3, footC, legShine);
+      this.drawLimb(ctx, -3.5 + st2 * 0.35, 3, -6 + st2, 3, 3.6, footC, legShine);
+      shoe(-6 + st, -3);
+      shoe(-6 + st2, 3);
     }
     if (kick > 0) {
       const ext = Math.sin(kickProg * Math.PI) * 26;
       ctx.save();
       ctx.rotate(-bodyTwist * 1.1);
-      this.drawLimb(ctx, -4, 3, 1, 2, 3.5, footC, legShine);
-      this.drawLimb(ctx, 1, 2, 5 + ext, 1, 3.1, footC, legShine);
+      this.drawLimb(ctx, -1, 3, 1, 2, 4.4, footC, legShine);
+      this.drawLimb(ctx, 1, 2, 5 + ext, 1, 3.8, footC, legShine);
       shoe(7 + ext, 1);
       if (ext > 18) {
       ctx.strokeStyle = 'rgba(160,128,132,0.28)';
@@ -2281,47 +2551,50 @@ export class Game {
     const armHi = enemy ? '#ff7165' : '#64666c';
     if (o.held) {
       // Captive raises both arms; the sharp shoulder silhouette reads clearly at game scale.
-      this.drawLimb(ctx, 1, -6, 2, -12, 4.2, armC, armHi);
-      this.drawLimb(ctx, 2, -12, -1, -17, 3.5, armC, armHi);
-      this.drawLimb(ctx, 1, 6, 2, 12, 4.2, armC, armHi);
-      this.drawLimb(ctx, 2, 12, -1, 17, 3.5, armC, armHi);
-      ctx.fillStyle = enemy ? '#ff6054' : '#5b5d62';
-      ctx.beginPath(); ctx.arc(-1, -18, 2.5, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(-1, 18, 2.5, 0, Math.PI * 2); ctx.fill();
+      this.drawLimb(ctx, 1, -7.6, 2, -12, 6.4, armC, armHi);
+      this.drawLimb(ctx, 2, -12, -1, -17, 5, armC, armHi);
+      this.drawLimb(ctx, 1, 7.6, 2, 12, 6.4, armC, armHi);
+      this.drawLimb(ctx, 2, 12, -1, 17, 5, armC, armHi);
+      this.drawHand(ctx, -1, -17, 3.6, -Math.PI / 2, armC, armHi, -1);
+      this.drawHand(ctx, -1, 17, 3.6, Math.PI / 2, armC, armHi, 1);
     } else if (weapon && !WEAPONS[weapon].melee) {
       const flinch = (o.hurt || 0) > 0.04 || (o.stagger || 0) > 0.04;
       if (flinch) {
         const f = Math.sin(this.time * 24) * 2;
-        this.drawLimb(ctx, 0, -5, -3 - f, -12, 4.5, armC, armHi);
-        this.drawLimb(ctx, -3 - f, -12, -9 - f, -14, 3.7, armC, armHi);
-        this.drawLimb(ctx, 0, 5, -3 + f, 12, 4.5, armC, armHi);
-        this.drawLimb(ctx, -3 + f, 12, -9 + f, 14, 3.7, armC, armHi);
+        this.drawLimb(ctx, 0, -7.5, -3 - f, -12, 6.6, armC, armHi);
+        this.drawLimb(ctx, -3 - f, -12, -9 - f, -14, 5.4, armC, armHi);
+        this.drawLimb(ctx, 0, 7.5, -3 + f, 12, 6.6, armC, armHi);
+        this.drawLimb(ctx, -3 + f, 12, -9 + f, 14, 5.4, armC, armHi);
         ctx.save(); ctx.translate(-2, 2); ctx.rotate(-0.7); this.drawWeapon(ctx, weapon); ctx.restore();
+        this.drawHand(ctx, -9 - f, -14, 3.5, -2.8, armC, armHi, -1);
+        this.drawHand(ctx, -9 + f, 14, 3.5, 2.8, armC, armHi, 1);
       } else {
         ctx.save();
         const kickB = muzzle > 0 ? -4 : 0;
         const recoil = kickB - (o.recoil || 0) * 22;
-        this.drawLimb(ctx, -1, 4, 4 + recoil * 0.45, 8, 4.2, armC, armHi);
-        this.drawLimb(ctx, 4 + recoil * 0.45, 8, 10 + recoil, 4, 3.6, armC, armHi);
-        this.drawLimb(ctx, -2, -5, 4 + recoil * 0.3, -7, 4.2, armC, armHi);
-        this.drawLimb(ctx, 4 + recoil * 0.3, -7, 10 + recoil, 1, 3.6, armC, armHi);
-        ctx.translate(9 + kickB, 3);
+        this.drawLimb(ctx, -1, 7.5, 4 + recoil * 0.45, 12, 6.4, armC, armHi);
+        this.drawLimb(ctx, 4 + recoil * 0.45, 12, 10 + recoil, 4, 5.2, armC, armHi);
+        this.drawLimb(ctx, -2, -7.5, 4 + recoil * 0.3, -12, 6.4, armC, armHi);
+        this.drawLimb(ctx, 4 + recoil * 0.3, -12, 13 + recoil, 1, 5.2, armC, armHi);
+        ctx.translate(9 + recoil, 3);
         this.drawWeapon(ctx, weapon);
         ctx.restore();
-        ctx.fillStyle = armHi;
-        ctx.beginPath(); ctx.arc(10 + kickB, 4, 2.7, 0, Math.PI * 2); ctx.fill();
-        ctx.beginPath(); ctx.arc(13 + kickB, 1, 2.6, 0, Math.PI * 2); ctx.fill();
+        this.drawHand(ctx, 10 + recoil, 4, 3.6, -0.5, armC, armHi, 1);
+        this.drawHand(ctx, 13 + recoil, 1, 3.4, 0.25, armC, armHi, -1);
       }
     } else if (o.hurt && o.hurt > 0.04 || o.stagger && o.stagger > 0.04) {
       const f = Math.sin(this.time * 20) * 2;
-      this.drawLimb(ctx, 0, -5, -2 - f, -12, 4.5, armC, armHi);
-      this.drawLimb(ctx, -2 - f, -12, -8 - f, -13, 3.7, armC, armHi);
-      this.drawLimb(ctx, 0, 5, -2 + f, 12, 4.5, armC, armHi);
-      this.drawLimb(ctx, -2 + f, 12, -8 + f, 13, 3.7, armC, armHi);
-      ctx.fillStyle = armHi;
-      ctx.beginPath(); ctx.arc(-9 - f, -13, 2.4, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(-9 + f, 13, 2.4, 0, Math.PI * 2); ctx.fill();
+      this.drawLimb(ctx, 0, -7.5, -2 - f, -12, 6.6, armC, armHi);
+      this.drawLimb(ctx, -2 - f, -12, -8 - f, -13, 5.4, armC, armHi);
+      this.drawLimb(ctx, 0, 7.5, -2 + f, 12, 6.6, armC, armHi);
+      this.drawLimb(ctx, -2 + f, 12, -8 + f, 13, 5.4, armC, armHi);
+      this.drawHand(ctx, -9 - f, -13, 3.5, -2.8, armC, armHi, -1);
+      this.drawHand(ctx, -9 + f, 13, 3.5, 2.8, armC, armHi, 1);
     } else if (weapon) {
+      // The free arm guards the upper body while the weapon arm swings.
+      this.drawLimb(ctx, 0, -7.5, 4, -12, 6.2, armC, armHi);
+      this.drawLimb(ctx, 4, -12, 9, -11, 5.2, armC, armHi);
+      this.drawHand(ctx, 9, -11, 3.6, 0.4, armC, armHi, -1, true);
       const sw = o.swing;
       let swing: number;
       if (sw) {
@@ -2340,7 +2613,7 @@ export class Game {
           const total = Math.min(Math.abs(head - sw.from), sw.spin ? 3.6 : 2.7);
           const N = 12;
           ctx.save();
-          ctx.translate(0, 6);
+          ctx.translate(0, 8.2);
           for (let k = 0; k < N; k++) {
             const a0 = head - dir * total * (k / N), a1 = head - dir * total * ((k + 1) / N);
             const al = (1 - k / N) * fade;
@@ -2372,18 +2645,17 @@ export class Game {
         if (!attackAnim && !windup) swing = 0.6;
       }
       ctx.save();
-      ctx.translate(0, 6);
+      ctx.translate(0, 8.2);
       ctx.rotate(swing);
-      this.drawLimb(ctx, -1, 0, 5, -2, 4, armC, armHi);
-      this.drawLimb(ctx, 5, -2, 10, 0, 3.4, armC, armHi);
+      this.drawLimb(ctx, -1, 0, 5, -2, 6.2, armC, armHi);
+      this.drawLimb(ctx, 5, -2, 10, 0, 5.2, armC, armHi);
       ctx.save(); ctx.translate(10, 0); this.drawWeapon(ctx, weapon); ctx.restore();
-      ctx.fillStyle = armC;
-      ctx.beginPath(); ctx.arc(10, 0, 3.2, 0, Math.PI * 2); ctx.fill();
+      this.drawHand(ctx, 10, 0, 3.7, 0, armC, armHi, 1, true);
       ctx.restore();
       if (!sw && attackAnim > 0.05) {
         ctx.strokeStyle = 'rgba(146,149,156,0.28)';
         ctx.lineWidth = 2;
-        ctx.beginPath(); ctx.arc(0, 6, 34, -1.1, swing); ctx.stroke();
+        ctx.beginPath(); ctx.arc(0, 8.2, 34, -1.1, swing); ctx.stroke();
       }
     } else {
       // fists: alternating jab/cross
@@ -2394,27 +2666,23 @@ export class Game {
       const side = o.side || 1;
       ctx.fillStyle = armC;
       const r1 = side > 0 ? punch : 0, r2 = side < 0 ? punch : 0;
-      this.drawLimb(ctx, 0, 5, 5 + r1 * 0.3, 7, 4.1, armC, armHi);
-      this.drawLimb(ctx, 5 + r1 * 0.3, 7, 9 + r1 + wl, 7 - r1 * 0.3, 3.4, armC, armHi);
-      this.drawLimb(ctx, 0, -5, 5 + r2 * 0.3, -7, 4.1, armC, armHi);
-      this.drawLimb(ctx, 5 + r2 * 0.3, -7, 9 + r2 + wl, -7 + r2 * 0.3, 3.4, armC, armHi);
-      ctx.beginPath(); ctx.arc(9 + r1 + wl, 7 - r1 * 0.3, 3.4, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(9 + r2 + wl, -7 + r2 * 0.3, 3.4, 0, Math.PI * 2); ctx.fill();
+      this.drawLimb(ctx, 0, 7.5, 5 + r1 * 0.3, 12, 6.4, armC, armHi);
+      this.drawLimb(ctx, 5 + r1 * 0.3, 12, 9 + r1 + wl, 11 - r1 * 0.3, 5.2, armC, armHi);
+      this.drawLimb(ctx, 0, -7.5, 5 + r2 * 0.3, -12, 6.4, armC, armHi);
+      this.drawLimb(ctx, 5 + r2 * 0.3, -12, 9 + r2 + wl, -11 + r2 * 0.3, 5.2, armC, armHi);
+      this.drawHand(ctx, 9 + r1 + wl, 11 - r1 * 0.3, 3.8, -0.15, armC, armHi, 1, true);
+      this.drawHand(ctx, 9 + r2 + wl, -11 + r2 * 0.3, 3.8, 0.15, armC, armHi, -1, true);
       if (punch > 8) {
         ctx.strokeStyle = 'rgba(206,174,174,0.45)';
         ctx.lineWidth = 0.8;
-        const yy = side > 0 ? 7 : -7;
+        const yy = side > 0 ? 11 : -11;
         for (let i = -1; i <= 1; i++) { ctx.beginPath(); ctx.moveTo(2, yy + i * 2.5); ctx.lineTo(6 + punch * 0.6, yy + i * 2.5); ctx.stroke(); }
       }
     }
 
     // crystalline body
-    const n = facets.length;
-    const pts: [number, number][] = [];
-    for (let i = 0; i < n; i++) {
-      const a = (i / n) * Math.PI * 2;
-      pts.push([Math.cos(a) * 8 * facets[i], Math.sin(a) * 13.5 * facets[i]]);
-    }
+    const pts = humanTorsoPoints(facets);
+    const n = pts.length;
     const flash = (o.flash || 0) > 0;
     const g = ctx.createLinearGradient(-8, -13, 8, 13);
     if (flash) { g.addColorStop(0, '#ffffff'); g.addColorStop(1, '#ffe3df'); }
@@ -2461,7 +2729,7 @@ export class Game {
     ctx.beginPath();
     for (let i = 0; i < 6; i++) {
       const a = (i / 6) * Math.PI * 2 + 0.3;
-      const r = 6.6 * facets[i];
+      const r = 5.8 * (1 + (facets[i] - 1) * 0.4);
       i ? ctx.lineTo(1 + Math.cos(a) * r, Math.sin(a) * r) : ctx.moveTo(1 + Math.cos(a) * r, Math.sin(a) * r);
     }
     ctx.closePath();
@@ -2493,9 +2761,11 @@ export class Game {
     this.drawLimb(ctx, -7, 4, -12 - wig * 0.3, 9, 5.2, dark, light);
     this.drawLimb(ctx, -12 - wig * 0.3, 9, -18 - wig, 14, 4.4, mid, light);
     this.drawLimb(ctx, 4, -5, 0 - wig * 0.4, -12, 4.8, dark, light);
-    this.drawLimb(ctx, 0 - wig * 0.4, -12, -6 - wig, -14, 3.8, mid, light);
+    this.drawLimb(ctx, 0 - wig * 0.4, -12, -6 - wig, -14, 5.2, mid, light);
     this.drawLimb(ctx, 4, 5, 0 + wig * 0.4, 12, 4.8, dark, light);
-    this.drawLimb(ctx, 0 + wig * 0.4, 12, -6 + wig, 14, 3.8, mid, light);
+    this.drawLimb(ctx, 0 + wig * 0.4, 12, -6 + wig, 14, 5.2, mid, light);
+    this.drawHand(ctx, -6 - wig, -14, 3.6, -2.6, mid, light, -1);
+    this.drawHand(ctx, -6 + wig, 14, 3.6, 2.6, mid, light, 1);
 
     const g = ctx.createLinearGradient(-14, -9, 12, 10);
     if (e.hitFlash > 0) { g.addColorStop(0, '#fff'); g.addColorStop(1, '#ffe1dc'); }
@@ -2675,7 +2945,11 @@ export class Game {
 
     for (const e of this.enemies) {
       if (e.state === 'down' || e === this.hostage) continue;
-      this.drawHuman(e.x, e.y, e.angle, true, e.weapon, e.walkT, e.attackAnim, e.facets, e.windup, e.muzzle, { flash: e.hitFlash, stagger: e.stagger, moveSpeed: e.moveSpeed });
+      this.drawHuman(e.x, e.y, e.angle, true, e.weapon, e.walkT, e.attackAnim, e.facets, e.windup, e.muzzle, { flash: e.hitFlash, stagger: e.stagger, moveSpeed: e.moveSpeed, boss: e.boss });
+      if (e.boss) {
+        ctx.font = '10px Anton, Impact, sans-serif'; ctx.textAlign = 'center';
+        ctx.fillStyle = '#a30e1d'; ctx.fillText('BIG BOSS', e.x, e.y - 25);
+      }
       if (e.alertFlash > 0) {
         ctx.fillStyle = '#e0141e';
         ctx.font = 'bold 16px Anton, Impact, sans-serif';
@@ -2863,6 +3137,7 @@ export class Game {
   renderHUD() {
     const ctx = this.ctx;
     const { cw, ch } = this;
+    const mobile = this.touch.enabled;
     const t = this.time;
     // vignette
     const vg = ctx.createRadialGradient(cw / 2, ch / 2, Math.min(cw, ch) * 0.35, cw / 2, ch / 2, Math.max(cw, ch) * 0.75);
@@ -2897,7 +3172,7 @@ export class Game {
 
     const pl = this.player;
     {
-      const bw = 180, bx = 30, by = 110;
+      const bw = mobile ? 112 : 180, bx = mobile ? 20 : 30, by = mobile ? 73 : 110;
       if (this.noSlowMo) {
         ctx.font = '13px Anton, Impact, sans-serif';
         ctx.textAlign = 'left';
@@ -2911,7 +3186,7 @@ export class Game {
         ctx.font = '11px Anton, Impact, sans-serif';
         ctx.textAlign = 'left';
         ctx.fillStyle = '#111';
-        ctx.fillText(this.focusActive ? 'FOCUS — SLOW MOTION' : 'FOCUS [RODA MOUSE / C]', bx, by + 22);
+        ctx.fillText(this.focusActive ? 'FOCUS — SLOW MOTION' : mobile ? 'FOCUS / TAHAN' : 'FOCUS [RODA MOUSE / C]', bx, by + 22);
       }
     }
     if (this.focusActive) {
@@ -2919,45 +3194,45 @@ export class Game {
       ctx.fillRect(0, 0, cw, ch);
       const fl = Math.sin(t * 8) > 0 ? 1 : 0.6;
       ctx.globalAlpha = fl;
-      this.hudText('SLOW MOTION', cw / 2, 130, 26, '#e0141e', 'center', '#111');
+      this.hudText('SLOW MOTION', cw / 2, mobile ? 94 : 130, mobile ? 16 : 26, '#e0141e', 'center', '#111');
       ctx.globalAlpha = 1;
     }
     if (pl.hitCount > 1 && this.state !== 'dead') {
       const sc = 1 + Math.max(0, pl.hitCountT - 1.25) * 3;
-      this.hudText(`${pl.hitCount} HITS`, cw / 2, ch * 0.22, 44 * sc, '#111', 'center', '#e0141e', Math.sin(t * 4) * 0.04);
+      this.hudText(`${pl.hitCount} HITS`, mobile ? cw * 0.73 : cw / 2, mobile ? 117 : ch * 0.22, (mobile ? 24 : 44) * sc, '#111', 'center', '#e0141e', Math.sin(t * 4) * 0.04);
     }
     if (this.superTime && !this.noSlowMo) {
       const on = this.worldScale < 0.5;
-      this.hudText(on ? 'TIME STOPPED' : 'TIME MOVES', cw / 2, ch - 70, 22, on ? '#e0141e' : '#111', 'center', '');
-      this.hudText('SUPERHOT MODE [T]', cw / 2, ch - 50, 12, '#111', 'center', '');
+      this.hudText(on ? 'TIME STOPPED' : 'TIME MOVES', cw / 2, mobile ? 115 : ch - 70, mobile ? 13 : 22, on ? '#e0141e' : '#111', 'center', '');
+      this.hudText('SUPERHOT MODE [T]', cw / 2, mobile ? 132 : ch - 50, mobile ? 9 : 12, '#111', 'center', '');
     }
     if (this.hostage && this.state === 'play') {
-      this.hudText('SHIELD ACTIVE — SPACE TO THROW', cw / 2, 134, 17, '#e0141e', 'center', '#111');
+      this.hudText(mobile ? 'SANDERA / AKSI UNTUK LEMPAR' : 'SHIELD ACTIVE — SPACE TO THROW', cw / 2, mobile ? 111 : 134, mobile ? 12 : 17, '#e0141e', 'center', '#111');
     }
 
     const lvl = LEVELS[this.levelIndex];
     const wob = Math.sin(t * 2) * 0.03;
-    this.hudText(lvl.name, 28, 62, 44, '#111', 'left', '#e0141e', wob);
-    this.hudText(`${this.score} PTS`, 30, 96, 24, '#111', 'left', 'rgba(224,20,30,0.7)', -wob * 0.5);
+    this.hudText(lvl.name, mobile ? 20 : 28, mobile ? 33 : 62, mobile ? 24 : 44, '#111', 'left', '#e0141e', wob);
+    this.hudText(`${this.score} PTS`, mobile ? 20 : 30, mobile ? 56 : 96, mobile ? 16 : 24, '#111', 'left', 'rgba(224,20,30,0.7)', -wob * 0.5);
     if (this.combo > 1) {
       const sc = 1 + Math.max(0, this.comboT - 3.2) * 0.8;
-      this.hudText(`${this.combo}X COMBO`, cw - 28, 62, 38 * sc, '#e0141e', 'right', '#111', -wob);
+      this.hudText(`${this.combo}X COMBO`, mobile ? cw * 0.73 : cw - 28, mobile ? 92 : 62, (mobile ? 16 : 38) * sc, '#e0141e', mobile ? 'center' : 'right', '#111', -wob);
       ctx.fillStyle = '#111';
-      ctx.fillRect(cw - 28 - 160 * (this.comboT / 3.6), 74, 160 * (this.comboT / 3.6), 4);
+      if (!mobile) ctx.fillRect(cw - 28 - 160 * (this.comboT / 3.6), 74, 160 * (this.comboT / 3.6), 4);
     }
     // weapon
     const p = this.player;
     const wname = p.weapon ? WEAPONS[p.weapon].name : 'UNARMED';
     const ammo = p.weapon && !WEAPONS[p.weapon].melee ? `${p.ammo} / ${WEAPONS[p.weapon].ammo}` : p.weapon ? 'MELEE' : 'FISTS';
-    this.hudText(wname, 28, ch - 58, 34, '#111', 'left', '#e0141e', wob * 0.7);
-    this.hudText(ammo, 30, ch - 26, 22, p.weapon && !WEAPONS[p.weapon].melee && p.ammo === 0 ? '#e0141e' : '#111', 'left', '');
-    this.hudText(`${this.enemies.length} / ${this.totalEnemies}`, cw - 28, ch - 58, 34, '#e0141e', 'right', '#111', -wob * 0.7);
-    this.hudText('ENEMIES LEFT', cw - 30, ch - 30, 16, '#111', 'right', '');
+    this.hudText(wname, mobile ? cw / 2 : 28, mobile ? 32 : ch - 58, mobile ? 18 : 34, '#111', mobile ? 'center' : 'left', '#e0141e', wob * 0.7);
+    this.hudText(ammo, mobile ? cw / 2 : 30, mobile ? 52 : ch - 26, mobile ? 12 : 22, p.weapon && !WEAPONS[p.weapon].melee && p.ammo === 0 ? '#e0141e' : '#111', mobile ? 'center' : 'left', '');
+    this.hudText(`${this.enemies.length} / ${this.totalEnemies}`, mobile ? cw - 126 : cw - 28, mobile ? 34 : ch - 58, mobile ? 22 : 34, '#e0141e', 'right', '#111', -wob * 0.7);
+    this.hudText('ENEMIES LEFT', mobile ? cw - 126 : cw - 30, mobile ? 51 : ch - 30, mobile ? 9 : 16, '#111', 'right', '');
     const mm = Math.floor(this.levelTime / 60), ss = Math.floor(this.levelTime % 60);
-    this.hudText(`${mm}:${ss.toString().padStart(2, '0')}`, cw - 28, 96, 20, '#111', 'right', '');
+    this.hudText(`${mm}:${ss.toString().padStart(2, '0')}`, mobile ? cw / 2 : cw - 28, mobile ? 71 : 96, mobile ? 10 : 20, '#111', mobile ? 'center' : 'right', '');
 
     // hint
-    if (this.hintT > 0 && this.state !== 'dead' && this.state !== 'complete') {
+    if (this.hintT > 0 && !mobile && this.state !== 'dead' && this.state !== 'complete') {
       ctx.globalAlpha = Math.min(1, this.hintT);
       ctx.font = '600 15px Rajdhani, sans-serif';
       ctx.textAlign = 'center';
@@ -2971,7 +3246,7 @@ export class Game {
 
     // exit arrow
     if (this.state === 'cleared') {
-      this.hudText('GO TO EXIT', cw / 2, 70 + Math.sin(t * 6) * 3, 40, '#e0141e', 'center', '#111');
+      this.hudText('GO TO EXIT', cw / 2, (mobile ? 114 : 70) + Math.sin(t * 6) * 3, mobile ? 22 : 40, '#e0141e', 'center', '#111');
       const ex = this.exitX * T + T / 2, ey = this.exitY * T + T / 2;
       const a = Math.atan2(ey - p.y, ex - p.x) + this.cam.rot;
       const r = Math.min(cw, ch) * 0.38;
@@ -2993,12 +3268,12 @@ export class Game {
       ctx.fillRect(0, 0, cw, ch);
       ctx.globalAlpha = a;
       this.hudText(`LEVEL ${this.levelIndex + 1}`, cw / 2, ch / 2 - 60, 26, '#111', 'center', '');
-      this.hudText(lvl.name, cw / 2, ch / 2 + 20, 110, '#e0141e', 'center', '#111', Math.sin(t * 3) * 0.02);
+      this.hudText(lvl.name, cw / 2, ch / 2 + 20, mobile ? Math.min(82, ch * 0.23) : 110, '#e0141e', 'center', '#111', Math.sin(t * 3) * 0.02);
       this.hudText(lvl.sub, cw / 2, ch / 2 + 60, 22, '#111', 'center', '');
       ctx.globalAlpha = 1;
     }
 
-    if (this.state === 'dead') {
+    if (this.state === 'dead' && !this.cb.onUIChange) {
       ctx.fillStyle = 'rgba(245,245,247,0.55)';
       ctx.fillRect(0, 0, cw, ch);
       const j = Math.sin(t * 20) * 2;
@@ -3007,7 +3282,7 @@ export class Game {
       this.hudText('[ESC] MENU', cw / 2, ch / 2 + 80, 16, '#111', 'center', '');
     }
 
-    if (this.state === 'paused') {
+    if (this.state === 'paused' && !this.cb.onUIChange) {
       ctx.fillStyle = 'rgba(245,245,247,0.8)';
       ctx.fillRect(0, 0, cw, ch);
       this.hudText('PAUSED', cw / 2, ch / 2, 90, '#111', 'center', '#e0141e');
@@ -3034,7 +3309,7 @@ export class Game {
         ctx.fillStyle = idx % 2 === 0 ? '#e0141e' : '#fff';
         ctx.fillText(word, 0, 0);
         ctx.restore();
-      } else {
+      } else if (!this.cb.onUIChange) {
         ctx.fillStyle = 'rgba(245,245,247,0.94)';
         ctx.fillRect(0, 0, cw, ch);
         const grade = this.grade();
@@ -3087,7 +3362,7 @@ export class Game {
         const lx = -Math.cos(a) * (size + 10), ly = -Math.sin(a) * (size + 10) + 4;
         ctx.fillStyle = '#111';
         ctx.fillText(alert ? '!' : e.weapon && !WEAPONS[e.weapon].melee ? '•' : '', lx, ly - 10);
-        ctx.fillText(`${Math.round(dist / T)}M`, lx, ly + 2);
+        ctx.fillText(e.boss ? 'BOSS' : `${Math.round(dist / T)}M`, lx, ly + 2);
         ctx.restore();
       }
       ctx.globalAlpha = 1;
@@ -3098,11 +3373,12 @@ export class Game {
       ctx.textAlign = 'left';
       ctx.font = '14px Anton, Impact, sans-serif';
       ctx.fillStyle = '#111';
-      ctx.fillText('HP', 30, ch - 96);
+      const hpY = mobile ? 113 : ch - 96;
+      ctx.fillText('HP', mobile ? 20 : 30, hpY);
       for (let i = 0; i < 3; i++) {
         const filled = pl.hp > i + 0.01;
         ctx.fillStyle = filled ? (pl.hp < 2 ? '#e0141e' : '#111') : 'rgba(17,17,17,0.18)';
-        ctx.fillRect(56 + i * 16, ch - 108, 12, 12);
+        ctx.fillRect((mobile ? 46 : 56) + i * 16, hpY - 12, 12, 12);
       }
       if (pl.hp < 3 && pl.alive) {
         ctx.fillStyle = `rgba(224,20,30,${(3 - pl.hp) * 0.08 + Math.sin(t * 6) * 0.03})`;
@@ -3110,6 +3386,8 @@ export class Game {
       }
     }
 
+    // Touch uses a directional aim stick; hide the idle mouse crosshair.
+    if (mobile && this.aimSource === 'touch' && !this.touch.aiming) return;
     // cursor
     const mx = this.mouse.x, my = this.mouse.y;
     if (pl.alive && pl.weapon === 'pistol' && this.headUnderCursor()) {
